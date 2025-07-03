@@ -1,0 +1,242 @@
+import folium
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+from pyproj import Transformer
+import os
+import webbrowser
+from pathlib import Path
+from geopy.distance import geodesic
+from collections import defaultdict
+import heapq
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+class LocomotiveRouter:
+    def __init__(self, shapefile_path, points_data, excel_path):
+        #инициализация класса: загрузка данных дорог, точек и расписание
+        self.roads = gpd.read_file(shapefile_path)
+        self.df_points = pd.DataFrame(points_data)
+        self.graph = self.build_railway_graph()  #построение графа железных дорог
+        self.service_points = points_data['name']  #точки обслуживания
+        self.excel_path = excel_path  #путь к файлу с расписанием
+
+        #параметры локомотивов: тип, количество, стоимость пробега и простоя
+        self.locomotives = {
+            '2ЭС5К': {'count': 28, 'empty_cost': 1065, 'idle_cost': 115},
+            '2ЭС6': {'count': 24, 'empty_cost': 1245, 'idle_cost': 124},
+            '2ЭС7': {'count': 22, 'empty_cost': 1253, 'idle_cost': 129}
+        }
+        self.loco_states = defaultdict(dict)  #состояние каждого локомотива
+        self.initialize_locomotives()  #объявление локомотивов
+        self.trains = self.load_train_schedule()  #загрузка расписания поездов
+        self.total_distance = 0  #общий пробег
+
+    def build_railway_graph(self):
+        #построение графа железных дорог из shapefile
+        graph = defaultdict(dict)
+        transformer = Transformer.from_crs("EPSG:32637", "EPSG:4326", always_xy=True)
+        for _, road in self.roads.iterrows():
+            if road.geometry.is_empty or road.geometry.geom_type != 'LineString':
+                continue  #пропускаем пустые или некорректные геометрии
+            coords = list(road.geometry.coords)
+            converted_coords = [transformer.transform(x, y) for x, y in coords]  #конвертация координат
+            for i in range(len(converted_coords) - 1):
+                lon1, lat1 = converted_coords[i]
+                lon2, lat2 = converted_coords[i + 1]
+                dist = geodesic((lat1, lon1), (lat2, lon2)).km  #расчет расстояния между точками
+                graph[(lat1, lon1)][(lat2, lon2)] = dist  #добавление ребра в граф
+                graph[(lat2, lon2)][(lat1, lon1)] = dist  #обратное направление
+        return graph
+
+    def initialize_locomotives(self):
+        #случайное начальное положение
+        loco_id = 1
+        for loco_type, params in self.locomotives.items():
+            for i in range(params['count']):
+                start_point = self.df_points.sample(1).iloc[0]  #случайная точка старта
+                self.loco_states[loco_id] = {
+                    'type': loco_type,
+                    'location': (start_point['latitude'], start_point['longitude']),
+                    'mileage': 0,  #пробег
+                    'available_time': 0,  #время доступности
+                    'next_service': 25000  #км до ТО
+                }
+                loco_id += 1
+
+    def load_train_schedule(self):
+        #загрузка расписания поездов из Excel
+        trains = []
+        try:
+            df = pd.read_excel(self.excel_path, sheet_name=0)
+            for _, row in df.iterrows():
+                start_point = self.find_station_coordinates(row['from'])  #координаты начальной станции
+                end_point = self.find_station_coordinates(row['to'])  #координаты конечной станции
+                if start_point is None or end_point is None:
+                    continue  # Пропускаем поезда с неизвестными станциями
+                departure_time = self.time_str_to_minutes(row['Отправление'])  #время отправления в минутах
+                duration = self.time_str_to_minutes(row['Время в пути, ч'])  #длительность в минутах
+                trains.append({
+                    'id': row['№ поезда'],
+                    'start': (start_point['latitude'], start_point['longitude']),
+                    'end': (end_point['latitude'], end_point['longitude']),
+                    'departure_time': departure_time,
+                    'duration': duration,
+                    'required_type': row.iloc[0]  #тип требуемого локомотива
+                })
+        except Exception as e:
+            print(f"Ошибка при чтении файла Excel: {e}")
+            for i in range(100):
+                start_point = self.df_points.sample(1).iloc[0]
+                end_point = self.df_points.sample(1).iloc[0]
+                trains.append({
+                    'id': i + 1,
+                    'start': (start_point['latitude'], start_point['longitude']),
+                    'end': (end_point['latitude'], end_point['longitude']),
+                    'departure_time': np.random.randint(0, 1440),
+                    'duration': np.random.randint(60, 360),
+                    'required_type': np.random.choice(['2ЭС5К', '2ЭС6', '2ЭС7'])
+                })
+        return trains
+
+    def find_station_coordinates(self, station_name):
+        #поиск координат станции по названию
+        if not station_name or pd.isna(station_name):
+            return None
+        result = self.df_points[self.df_points['name'].str.contains(station_name, case=False, na=False)]
+        if not result.empty:
+            return result.iloc[0]
+        return None
+
+    def time_str_to_minutes(self, time_str):
+        #конвертация строки времени в минуты
+        if pd.isna(time_str):
+            return 0
+        if isinstance(time_str, str):
+            parts = time_str.split(':')
+            if len(parts) >= 2:
+                try:
+                    hours = int(parts[0])
+                    minutes = int(parts[1])
+                    return hours * 60 + minutes
+                except ValueError:
+                    return 0
+        elif isinstance(time_str, (int, float)):
+            return int(time_str * 60)
+        return 0
+
+    def find_shortest_path(self, start, end):
+        #поиск кратчайшего пути между точками (алгоритм Дейкстры)
+        heap = [(0, start, [])]  #очередь с приоритетом: (стоимость, текущая точка, путь)
+        visited = set()
+        while heap:
+            cost, current, path = heapq.heappop(heap)
+            if current in visited:
+                continue
+            visited.add(current)
+            path = path + [current]
+            if current == end:
+                return cost, path  #найден путь
+            for neighbor, distance in self.graph.get(current, {}).items():
+                if neighbor not in visited:
+                    heapq.heappush(heap, (cost + distance, neighbor, path))
+        return float('inf'), []  #путь не найден
+
+    def calculate_path_distance(self, path):
+        #расчет расстояния пути по списку координат
+        return sum(geodesic(path[i], path[i + 1]).km for i in range(len(path) - 1))
+
+    def assign_locomotives(self):
+        #локомотивов на поезда с учетом стоимости и времени
+        assignments = []
+        sorted_trains = sorted(self.trains, key=lambda x: x['departure_time'])  #сортировка по времени отправления
+        for train in sorted_trains:
+            best_cost = float('inf')
+            best_loco, best_path, service_needed, service_path_after = None, [], False, []
+            for loco_id, loco in self.loco_states.items():
+                if loco['type'] != train['required_type'] or loco['available_time'] > train['departure_time']:
+                    continue  #локомотив не подходит по типу или занят
+                distance, path = self.find_shortest_path(loco['location'], train['start'])
+                if distance == float('inf'):
+                    continue  #путь не найден
+                route_distance = self.calculate_path_distance([train['start'], train['end']])
+                total_mileage = loco['mileage'] + distance + route_distance
+                needs_service = total_mileage >= loco['next_service']  #проверка необходимости ТО
+                cost = distance * self.locomotives[loco['type']]['empty_cost']  #стоимость порожнего пробега
+                idle_time = max(0, train['departure_time'] - loco['available_time'])
+                cost += idle_time * self.locomotives[loco['type']]['idle_cost']  #стоимость простоя
+                if needs_service:
+                    service_dist, service_path = self.find_nearest_service_point(train['end'])
+                    cost += service_dist * self.locomotives[loco['type']]['empty_cost']  #стоимость до ТО
+                if cost < best_cost:
+                    best_cost = cost
+                    best_loco = loco_id
+                    best_path = path
+                    service_needed = needs_service
+                    service_path_after = service_path if needs_service else []
+            if best_loco:
+                #формирование назначения
+                assignments.append({
+                    'train_id': train['id'],
+                    'loco_id': best_loco,
+                    'path': best_path,
+                    'service_needed': service_needed,
+                    'service_path': service_path_after,
+                    'cost': best_cost,
+                    'distance': self.calculate_path_distance([train['start'], train['end']]),
+                    'empty_distance': self.calculate_path_distance(best_path)
+                })
+                self.total_distance += assignments[-1]['distance']
+                #обновление состояния локомотива
+                loco = self.loco_states[best_loco]
+                loco['mileage'] += assignments[-1]['empty_distance'] + assignments[-1]['distance']
+                loco['available_time'] = train['departure_time'] + train['duration']
+                loco['location'] = train['end']
+                if service_needed:
+                    loco['next_service'] = 25000  #сброс счетчика до ТО
+                else:
+                    loco['next_service'] -= assignments[-1]['empty_distance'] + assignments[-1]['distance']
+        return assignments
+
+    def find_nearest_service_point(self, location):
+        #поиск ближайшей точки обслуживания
+        min_dist, best_path = float('inf'), []
+        for _, point in self.df_points.iterrows():
+            target = (point['latitude'], point['longitude'])
+            dist, path = self.find_shortest_path(location, target)
+            if dist < min_dist:
+                min_dist, best_path = dist, path
+        return min_dist, best_path
+
+if __name__ == "__main__":
+    #пример использования класса
+    shapefile_path = Path(r"C:\Users\kozin\Downloads\Telegram Desktop\all_routes_v2\all_routes_v2.shp")
+    excel_path = r"C:\Users\kozin\Downloads\Telegram Desktop\routes.xlsx"
+    points_data = {
+        'name': ['Бекасово-Центральное', 'Перово', 'Аэропорт', 'Яничкино', 'Красное',
+                 'Елец', 'Брянск-Льговский', 'Орёл', 'Курбакинская', 'Льгов-Киевский',
+                 'Тула-1-Курская', 'Лужки-Орловские', 'Курск', 'Белгород'],
+        'longitude': [36.88475, 37.78648, 37.53315, 37.85962, 31.03734,
+                      38.4833, 34.3456, 36.0786, 35.1234, 34.5678,
+                      37.6543, 36.8765, 36.1876, 36.5987],
+        'latitude': [55.40511, 55.7512, 55.8004, 55.65347, 54.68266,
+                     52.6167, 53.2345, 52.9654, 54.3210, 53.4567,
+                     54.1932, 52.3456, 51.7303, 50.6010]
+    }
+    router = LocomotiveRouter(shapefile_path, points_data, excel_path)
+    assignments = router.assign_locomotives()
+
+    #вывод статистики
+    total_cost = sum(a['cost'] for a in assignments)
+    total_loaded = sum(a['distance'] for a in assignments)
+    total_empty = sum(a['empty_distance'] for a in assignments)
+
+    print(f"\n📊 Статистика работы:")
+    print(f"Всего назначений: {len(assignments)}")
+    print(f"Общая стоимость: {total_cost:.2f} руб.")
+    if assignments:
+        print(f"Средняя стоимость на поезд: {total_cost / len(assignments):.2f} руб.")
+    else:
+        print(f"Средняя стоимость на поезд: -")
+    print(f"Общий груженый пробег: {total_loaded:.1f} км")
+    print(f"Общий порожний пробег: {total_empty:.1f} км")
